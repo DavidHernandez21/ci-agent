@@ -1,5 +1,7 @@
 all: ci-agentd
 
+CC ?= gcc
+
 BPF_HEADERS = vmlinux.h
 
 vmlinux.h:
@@ -42,14 +44,14 @@ CPPFLAGS += $(ZLIB_CFLAGS)
 CFLAGS ?= -O2 -Wall -g -std=gnu2x
 
 %.o: %.c
-	gcc $(CPPFLAGS) $(CFLAGS) -c $< -o $@
+	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
 
 AGENT_LIBS += $(BPF_LIBS)
 AGENT_LIBS += $(ELF_LIBS)
 AGENT_LIBS += $(ZLIB_LIBS)
 
 ci-agentd: $(BPF_OBJS) $(AGENT_OBJS)
-	gcc -o $@ $(AGENT_OBJS) $(AGENT_LIBS) $(LDFLAGS)
+	$(CC) -o $@ $(AGENT_OBJS) $(AGENT_LIBS) $(LDFLAGS)
 
 clean:
 	rm -f $(ALL_HEADERS) $(ALL_OBJS) ci-agentd ci-agent-client
