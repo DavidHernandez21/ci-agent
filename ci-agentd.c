@@ -1,6 +1,8 @@
 #define _GNU_SOURCE
 #include <errno.h>
+#include <getopt.h>
 #include <signal.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -24,10 +26,138 @@ enum fd_tag {
 
 static volatile sig_atomic_t stop;
 
+struct ip_filter {
+	bool set;
+	bool loopback;
+	__u8 family;
+	__u32 addr[4];
+};
+
+struct event_filter {
+	bool has_pid;
+	__u32 pid;
+	bool has_proto;
+	__u32 type;
+	bool has_exe;
+	char exe[PATH_MAX];
+	struct ip_filter src;
+	struct ip_filter dst;
+	bool exclude_local_src;
+	bool exclude_local_dst;
+	__u16 exclude_ports[MAX_EXCLUDE_PORTS];
+	size_t exclude_port_count;
+};
+
 static void sigint_handler(int signo)
 {
 	(void) signo;
 	stop = 1;
+}
+
+static void print_usage(const char *argv0)
+{
+	fprintf(stderr,
+		"Usage: %s [options]\n"
+		"\n"
+		"Options:\n"
+		"  -p, --pid <pid>         Match process id\n"
+		"  -P, --proto <tcp|udp>   Match protocol\n"
+		"  -e, --exe <string>      Substring match on executable path/comm (case-insensitive)\n"
+		"  -s, --src <ip>          Match source IP (IPv4/IPv6) or 'local' for loopback\n"
+		"  -d, --dst <ip>          Match destination IP (IPv4/IPv6) or 'local' for loopback\n"
+		"  -x, --no-port <port>    Exclude events with source or destination port\n"
+		"      --no-local-src      Exclude loopback as source (127.0.0.0/8, ::1)\n"
+		"      --no-local-dst      Exclude loopback as destination (127.0.0.0/8, ::1)\n"
+		"  -h, --help              Show this help\n",
+		argv0);
+}
+
+static int parse_proto(const char *s, __u32 *out_type)
+{
+	if (s == NULL || out_type == NULL)
+		return -EINVAL;
+
+	if (strcasecmp(s, "tcp") == 0) {
+		*out_type = EV_TCP_EGRESS;
+		return 0;
+	}
+	if (strcasecmp(s, "udp") == 0) {
+		*out_type = EV_UDP_EGRESS;
+		return 0;
+	}
+
+	return -EINVAL;
+}
+
+static int parse_ip_filter(const char *s, struct ip_filter *out)
+{
+	unsigned char buf[16];
+	__u32 ip4;
+
+	if (s == NULL || out == NULL)
+		return -EINVAL;
+
+	memset(out, 0, sizeof(*out));
+
+	if (strcasecmp(s, "local") == 0 || strcasecmp(s, "localhost") == 0 ||
+	    strcasecmp(s, "loopback") == 0) {
+		out->set = true;
+		out->loopback = true;
+		return 0;
+	}
+
+	if (inet_pton(AF_INET, s, buf) == 1) {
+		memcpy(&ip4, buf, sizeof(ip4));
+		out->set = true;
+		out->family = AF_INET;
+		out->addr[0] = ntohl(ip4);
+		return 0;
+	}
+
+	if (inet_pton(AF_INET6, s, buf) == 1) {
+		out->set = true;
+		out->family = AF_INET6;
+		memcpy(&out->addr[0], buf, sizeof(out->addr));
+		return 0;
+	}
+
+	return -EINVAL;
+}
+
+static bool match_event_filter(const struct event_filter *f,
+			       const struct event *e,
+			       const char *exe_display)
+{
+	if (f == NULL)
+		return true;
+
+	(void)e;
+
+	if (f->has_exe) {
+		if (exe_display == NULL || strcasestr(exe_display, f->exe) == NULL)
+			return false;
+	}
+
+	return true;
+}
+
+static int add_exclude_port(struct event_filter *filter, const char *s)
+{
+	char *end = NULL;
+	unsigned long port;
+
+	if (filter == NULL || s == NULL)
+		return -EINVAL;
+
+	if (filter->exclude_port_count >= MAX_EXCLUDE_PORTS)
+		return -ENOSPC;
+
+	port = strtoul(s, &end, 10);
+	if (end == s || *end != '\0' || port == 0 || port > 65535)
+		return -EINVAL;
+
+	filter->exclude_ports[filter->exclude_port_count++] = (__u16)port;
+	return 0;
 }
 
 static void format_ipv4(char *buf, size_t len, __u32 addr)
@@ -63,6 +193,7 @@ static int get_executable_path(pid_t pid, char *buf, size_t len)
 struct event_handler_ctx {
 	struct ci_agent_broadcaster *broadcaster;
 	struct bpf_map *dns_map;
+	struct event_filter filter;
 };
 
 static int eventloop_register(int ep_fd, int fd, enum fd_tag tag)
@@ -80,6 +211,7 @@ static int handle_event(void *ctx, void *data, size_t data_sz)
 	struct event_handler_ctx *handler_ctx = ctx;
 	struct ci_agent_broadcaster *broadcaster = handler_ctx->broadcaster;
 	struct bpf_map *dns_map = handler_ctx->dns_map;
+	const struct event_filter *filter = &handler_ctx->filter;
 	char saddr_str[INET6_ADDRSTRLEN];
 	char daddr_str[INET6_ADDRSTRLEN];
 	char exe_path[PATH_MAX];
@@ -98,13 +230,7 @@ static int handle_event(void *ctx, void *data, size_t data_sz)
 		return 0;
 	}
 
-	if (e->family == AF_INET) {
-		format_ipv4(saddr_str, sizeof(saddr_str), e->saddr[0]);
-		format_ipv4(daddr_str, sizeof(daddr_str), e->daddr[0]);
-	} else if (e->family == AF_INET6) {
-		format_ipv6(saddr_str, sizeof(saddr_str), e->saddr);
-		format_ipv6(daddr_str, sizeof(daddr_str), e->daddr);
-	} else {
+	if (e->family != AF_INET && e->family != AF_INET6) {
 		return 0;
 	}
 
@@ -114,6 +240,17 @@ static int handle_event(void *ctx, void *data, size_t data_sz)
 	} else {
 		/* Fall back to comm if we can't read the path */
 		exe_display = e->comm;
+	}
+
+	if (!match_event_filter(filter, e, exe_display))
+		return 0;
+
+	if (e->family == AF_INET) {
+		format_ipv4(saddr_str, sizeof(saddr_str), e->saddr[0]);
+		format_ipv4(daddr_str, sizeof(daddr_str), e->daddr[0]);
+	} else {
+		format_ipv6(saddr_str, sizeof(saddr_str), e->saddr);
+		format_ipv6(daddr_str, sizeof(daddr_str), e->daddr);
 	}
 
 	/* Look up hostname from DNS map */
@@ -178,8 +315,117 @@ static int handle_event(void *ctx, void *data, size_t data_sz)
 	return 0;
 }
 
-int main(void)
+static int update_bpf_filter_config(struct ci_agent_bpf *skel,
+				    const struct event_filter *filter)
 {
+	struct bpf_filter_config cfg = {0};
+	__u32 key = 0;
+	int map_fd;
+
+	if (skel == NULL || filter == NULL)
+		return -EINVAL;
+
+	cfg.has_pid = filter->has_pid ? 1 : 0;
+	cfg.pid = filter->pid;
+	cfg.has_proto = filter->has_proto ? 1 : 0;
+	cfg.type = filter->type;
+	cfg.exclude_local_src = filter->exclude_local_src ? 1 : 0;
+	cfg.exclude_local_dst = filter->exclude_local_dst ? 1 : 0;
+	cfg.src.set = filter->src.set ? 1 : 0;
+	cfg.src.loopback = filter->src.loopback ? 1 : 0;
+	cfg.src.family = filter->src.family;
+	memcpy(cfg.src.addr, filter->src.addr, sizeof(cfg.src.addr));
+	cfg.dst.set = filter->dst.set ? 1 : 0;
+	cfg.dst.loopback = filter->dst.loopback ? 1 : 0;
+	cfg.dst.family = filter->dst.family;
+	memcpy(cfg.dst.addr, filter->dst.addr, sizeof(cfg.dst.addr));
+	if (filter->exclude_port_count > MAX_EXCLUDE_PORTS)
+		cfg.exclude_port_count = MAX_EXCLUDE_PORTS;
+	else
+		cfg.exclude_port_count = (unsigned char)filter->exclude_port_count;
+	for (size_t i = 0; i < cfg.exclude_port_count; i++)
+		cfg.exclude_ports[i] = filter->exclude_ports[i];
+
+	map_fd = bpf_map__fd(skel->maps.filter_config_map);
+	if (map_fd < 0)
+		return -EINVAL;
+
+	return bpf_map_update_elem(map_fd, &key, &cfg, BPF_ANY);
+}
+
+int main(int argc, char **argv)
+{
+	struct event_filter filter = {0};
+	int opt;
+	int opt_index = 0;
+
+	static struct option long_opts[] = {
+		{"pid", required_argument, NULL, 'p'},
+		{"proto", required_argument, NULL, 'P'},
+		{"exe", required_argument, NULL, 'e'},
+		{"src", required_argument, NULL, 's'},
+		{"dst", required_argument, NULL, 'd'},
+		{"no-port", required_argument, NULL, 'x'},
+		{"no-local-src", no_argument, NULL, 1},
+		{"no-local-dst", no_argument, NULL, 2},
+		{"help", no_argument, NULL, 'h'},
+		{NULL, 0, NULL, 0},
+	};
+
+	while ((opt = getopt_long(argc, argv, "p:P:e:s:d:x:h", long_opts, &opt_index)) != -1) {
+		switch (opt) {
+			case 'p':
+				filter.has_pid = true;
+				filter.pid = (__u32)strtoul(optarg, NULL, 10);
+				break;
+			case 'P':
+				if (parse_proto(optarg, &filter.type) != 0) {
+					fprintf(stderr, "invalid proto: %s\n", optarg);
+					print_usage(argv[0]);
+					return 1;
+				}
+				filter.has_proto = true;
+				break;
+			case 'e':
+				filter.has_exe = true;
+				snprintf(filter.exe, sizeof(filter.exe), "%s", optarg);
+				break;
+			case 's':
+				if (parse_ip_filter(optarg, &filter.src) != 0) {
+					fprintf(stderr, "invalid source IP: %s\n", optarg);
+					print_usage(argv[0]);
+					return 1;
+				}
+				break;
+			case 'd':
+				if (parse_ip_filter(optarg, &filter.dst) != 0) {
+					fprintf(stderr, "invalid destination IP: %s\n", optarg);
+					print_usage(argv[0]);
+					return 1;
+				}
+				break;
+			case 'x':
+				if (add_exclude_port(&filter, optarg) != 0) {
+					fprintf(stderr, "invalid port: %s\n", optarg);
+					print_usage(argv[0]);
+					return 1;
+				}
+				break;
+			case 1:
+				filter.exclude_local_src = true;
+				break;
+			case 2:
+				filter.exclude_local_dst = true;
+				break;
+			case 'h':
+				print_usage(argv[0]);
+				return 0;
+			default:
+				print_usage(argv[0]);
+				return 1;
+		}
+	}
+
 	signal(SIGINT, sigint_handler);
 	signal(SIGTERM, sigint_handler);
 
@@ -202,6 +448,14 @@ int main(void)
 	if (err) {
 		fprintf(stderr, "load failed: %s\n", strerror(-err));
 		ci_agent_bpf__destroy(skel);
+		return 1;
+	}
+
+	err = update_bpf_filter_config(skel, &filter);
+	if (err) {
+		fprintf(stderr, "setting BPF filter failed: %s\n", strerror(-err));
+		ci_agent_bpf__destroy(skel);
+		ci_agent_broadcaster_fini(broadcaster);
 		return 1;
 	}
 	err = ci_agent_bpf__attach(skel);
@@ -230,6 +484,7 @@ int main(void)
 	struct event_handler_ctx handler_ctx = {
 		.broadcaster = broadcaster,
 		.dns_map = skel->maps.dns_map,
+		.filter = filter,
 	};
 
 	struct ring_buffer *rb =

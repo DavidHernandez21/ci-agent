@@ -40,6 +40,13 @@ struct {
 	__type(value, struct dns_mapping_value);
 } dns_map SEC(".maps");
 
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__uint(max_entries, 1);
+	__type(key, __u32);
+	__type(value, struct bpf_filter_config);
+} filter_config_map SEC(".maps");
+
 static __always_inline __u16 bpf_ntohs(__u16 val)
 {
 	return ((val & 0x00ff) << 8) | ((val & 0xff00) >> 8);
@@ -112,14 +119,103 @@ static __always_inline void fill_network_info(struct event *e, struct sock *sk, 
 	}
 }
 
+static __always_inline int is_loopback_v4(__u32 addr)
+{
+	return (addr & 0xff000000) == 0x7f000000;
+}
+
+static __always_inline int is_loopback_v6(const __u32 *addr)
+{
+	return addr[0] == 0 && addr[1] == 0 && addr[2] == 0 && addr[3] == 1;
+}
+
+static __always_inline int match_ip_filter_bpf(const struct bpf_ip_filter *f,
+				      const struct event *e,
+				      int is_src)
+{
+	if (!f || !f->set)
+		return 1;
+
+	if (f->loopback) {
+		if (e->family == AF_INET) {
+			__u32 addr = is_src ? e->saddr[0] : e->daddr[0];
+			return is_loopback_v4(addr);
+		}
+		if (e->family == AF_INET6) {
+			const __u32 *addr = is_src ? e->saddr : e->daddr;
+			return is_loopback_v6(addr);
+		}
+
+		return 0;
+	}
+
+	if (e->family != f->family)
+		return 0;
+
+	if (f->family == AF_INET) {
+		return is_src ? (e->saddr[0] == f->addr[0])
+			      : (e->daddr[0] == f->addr[0]);
+	}
+
+	if (is_src) {
+		return e->saddr[0] == f->addr[0] &&
+		       e->saddr[1] == f->addr[1] &&
+		       e->saddr[2] == f->addr[2] &&
+		       e->saddr[3] == f->addr[3];
+	}
+
+	return e->daddr[0] == f->addr[0] &&
+	       e->daddr[1] == f->addr[1] &&
+	       e->daddr[2] == f->addr[2] &&
+	       e->daddr[3] == f->addr[3];
+}
+
 SEC("fentry/tcp_sendmsg")
 int BPF_PROG(on_tcp_sendmsg,
 	     struct sock *sk,
 	     struct msghdr *msg,
 	     size_t size)
 {
+	struct bpf_filter_config *cfg;
+	__u32 cfg_key = 0;
+	__u32 pid;
+	struct event net = {};
+
 	if (!sk)
 		return 0;
+
+	cfg = bpf_map_lookup_elem(&filter_config_map, &cfg_key);
+	if (cfg) {
+		pid = bpf_get_current_pid_tgid() >> 32;
+		if (cfg->has_pid && pid != cfg->pid)
+			return 0;
+		if (cfg->has_proto && cfg->type != EV_TCP_EGRESS)
+			return 0;
+	}
+
+	fill_network_info(&net, sk, size);
+	if (cfg) {
+		if (cfg->exclude_local_src && is_loopback_v4(net.saddr[0]) && net.family == AF_INET)
+			return 0;
+		if (cfg->exclude_local_src && net.family == AF_INET6 && is_loopback_v6(net.saddr))
+			return 0;
+		if (cfg->exclude_local_dst && is_loopback_v4(net.daddr[0]) && net.family == AF_INET)
+			return 0;
+		if (cfg->exclude_local_dst && net.family == AF_INET6 && is_loopback_v6(net.daddr))
+			return 0;
+		if (!match_ip_filter_bpf(&cfg->src, &net, 1))
+			return 0;
+		if (!match_ip_filter_bpf(&cfg->dst, &net, 0))
+			return 0;
+		if (cfg->exclude_port_count) {
+			for (int i = 0; i < MAX_EXCLUDE_PORTS; i++) {
+				if (i >= cfg->exclude_port_count)
+					break;
+				if (net.sport == cfg->exclude_ports[i] || net.dport == cfg->exclude_ports[i])
+					return 0;
+			}
+		}
+	}
 
 	struct event *e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);
 	if (!e)
@@ -133,19 +229,30 @@ int BPF_PROG(on_tcp_sendmsg,
 	bpf_get_current_comm(&e->comm, sizeof(e->comm));
 	e->protocol = IPPROTO_TCP;
 	
-	fill_network_info(e, sk, size);
+	e->family = net.family;
+	e->sport = net.sport;
+	e->dport = net.dport;
+	e->saddr[0] = net.saddr[0];
+	e->saddr[1] = net.saddr[1];
+	e->saddr[2] = net.saddr[2];
+	e->saddr[3] = net.saddr[3];
+	e->daddr[0] = net.daddr[0];
+	e->daddr[1] = net.daddr[1];
+	e->daddr[2] = net.daddr[2];
+	e->daddr[3] = net.daddr[3];
+	e->bytes_sent = net.bytes_sent;
 	
 	/* Look up hostname from DNS map */
-	struct dns_mapping_key key = {0};
+	struct dns_mapping_key dns_key = {0};
 	if (e->family == AF_INET) {
-		key.ip[0] = e->daddr[0];
-		key.family = AF_INET;
+		dns_key.ip[0] = e->daddr[0];
+		dns_key.family = AF_INET;
 	} else if (e->family == AF_INET6) {
-		key.ip[0] = e->daddr[0];
-		key.ip[1] = e->daddr[1];
-		key.ip[2] = e->daddr[2];
-		key.ip[3] = e->daddr[3];
-		key.family = AF_INET6;
+		dns_key.ip[0] = e->daddr[0];
+		dns_key.ip[1] = e->daddr[1];
+		dns_key.ip[2] = e->daddr[2];
+		dns_key.ip[3] = e->daddr[3];
+		dns_key.family = AF_INET6;
 	}
 	
 	/* Note: We can't store hostname in event struct directly in BPF */
@@ -164,8 +271,46 @@ int BPF_PROG(on_udp_sendmsg,
 	     struct msghdr *msg,
 	     size_t len)
 {
+	struct bpf_filter_config *cfg;
+	__u32 cfg_key = 0;
+	__u32 pid;
+	struct event net = {};
+
 	if (!sk)
 		return 0;
+
+	cfg = bpf_map_lookup_elem(&filter_config_map, &cfg_key);
+	if (cfg) {
+		pid = bpf_get_current_pid_tgid() >> 32;
+		if (cfg->has_pid && pid != cfg->pid)
+			return 0;
+		if (cfg->has_proto && cfg->type != EV_UDP_EGRESS)
+			return 0;
+	}
+
+	fill_network_info(&net, sk, len);
+	if (cfg) {
+		if (cfg->exclude_local_src && is_loopback_v4(net.saddr[0]) && net.family == AF_INET)
+			return 0;
+		if (cfg->exclude_local_src && net.family == AF_INET6 && is_loopback_v6(net.saddr))
+			return 0;
+		if (cfg->exclude_local_dst && is_loopback_v4(net.daddr[0]) && net.family == AF_INET)
+			return 0;
+		if (cfg->exclude_local_dst && net.family == AF_INET6 && is_loopback_v6(net.daddr))
+			return 0;
+		if (!match_ip_filter_bpf(&cfg->src, &net, 1))
+			return 0;
+		if (!match_ip_filter_bpf(&cfg->dst, &net, 0))
+			return 0;
+		if (cfg->exclude_port_count) {
+			for (int i = 0; i < MAX_EXCLUDE_PORTS; i++) {
+				if (i >= cfg->exclude_port_count)
+					break;
+				if (net.sport == cfg->exclude_ports[i] || net.dport == cfg->exclude_ports[i])
+					return 0;
+			}
+		}
+	}
 
 	struct event *e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);
 	if (!e)
@@ -179,7 +324,18 @@ int BPF_PROG(on_udp_sendmsg,
 	bpf_get_current_comm(&e->comm, sizeof(e->comm));
 	e->protocol = IPPROTO_UDP;
 	
-	fill_network_info(e, sk, len);
+	e->family = net.family;
+	e->sport = net.sport;
+	e->dport = net.dport;
+	e->saddr[0] = net.saddr[0];
+	e->saddr[1] = net.saddr[1];
+	e->saddr[2] = net.saddr[2];
+	e->saddr[3] = net.saddr[3];
+	e->daddr[0] = net.daddr[0];
+	e->daddr[1] = net.daddr[1];
+	e->daddr[2] = net.daddr[2];
+	e->daddr[3] = net.daddr[3];
+	e->bytes_sent = net.bytes_sent;
 	
 	bpf_ringbuf_submit(e, 0);
 	return 0;
