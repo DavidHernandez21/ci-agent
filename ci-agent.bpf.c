@@ -126,7 +126,7 @@ static __always_inline int is_loopback_v4(__u32 addr)
 
 static __always_inline int is_loopback_v6(const __u32 *addr)
 {
-	return addr[0] == 0 && addr[1] == 0 && addr[2] == 0 && addr[3] == 1;
+	return addr[0] == 0 && addr[1] == 0 && addr[2] == 0 && bpf_ntohl(addr[3]) == 1;
 }
 
 static __always_inline int match_ip_filter_bpf(const struct bpf_ip_filter *f,
@@ -157,6 +157,7 @@ static __always_inline int match_ip_filter_bpf(const struct bpf_ip_filter *f,
 			      : (e->daddr[0] == f->addr[0]);
 	}
 
+	/* IPv6 words are stored in network byte order on both sides; compare raw. */
 	if (is_src) {
 		return e->saddr[0] == f->addr[0] &&
 		       e->saddr[1] == f->addr[1] &&
@@ -168,6 +169,52 @@ static __always_inline int match_ip_filter_bpf(const struct bpf_ip_filter *f,
 	       e->daddr[1] == f->addr[1] &&
 	       e->daddr[2] == f->addr[2] &&
 	       e->daddr[3] == f->addr[3];
+}
+
+static __always_inline int filter_event(const struct bpf_filter_config *cfg,
+					      const struct event *net,
+					      __u32 pid,
+					      __u32 type)
+{
+	if (!cfg)
+		return 1;
+
+	if (cfg->has_pid && pid != cfg->pid)
+		return 0;
+	if (cfg->has_proto && cfg->type != type)
+		return 0;
+	if (net->family == AF_INET && cfg->exclude_local_src && is_loopback_v4(net->saddr[0]))
+		return 0;
+	if (net->family == AF_INET6 && cfg->exclude_local_src && is_loopback_v6(net->saddr))
+		return 0;
+	if (net->family == AF_INET && cfg->exclude_local_dst && is_loopback_v4(net->daddr[0]))
+		return 0;
+	if (net->family == AF_INET6 && cfg->exclude_local_dst && is_loopback_v6(net->daddr))
+		return 0;
+	if (!match_ip_filter_bpf(&cfg->src, net, 1))
+		return 0;
+	if (!match_ip_filter_bpf(&cfg->dst, net, 0))
+		return 0;
+	if (cfg->exclude_port_count) {
+		for (int i = 0; i < MAX_EXCLUDE_PORTS; i++) {
+			if (i >= cfg->exclude_port_count)
+				break;
+			if (net->sport == cfg->exclude_ports[i] || net->dport == cfg->exclude_ports[i])
+				return 0;
+		}
+	}
+
+	return 1;
+}
+
+static __always_inline void copy_network_fields(struct event *dst, const struct event *src)
+{
+	dst->family = src->family;
+	dst->sport = src->sport;
+	dst->dport = src->dport;
+	__builtin_memcpy(dst->saddr, src->saddr, sizeof(dst->saddr));
+	__builtin_memcpy(dst->daddr, src->daddr, sizeof(dst->daddr));
+	dst->bytes_sent = src->bytes_sent;
 }
 
 SEC("fentry/tcp_sendmsg")
@@ -185,37 +232,11 @@ int BPF_PROG(on_tcp_sendmsg,
 		return 0;
 
 	cfg = bpf_map_lookup_elem(&filter_config_map, &cfg_key);
-	if (cfg) {
-		pid = bpf_get_current_pid_tgid() >> 32;
-		if (cfg->has_pid && pid != cfg->pid)
-			return 0;
-		if (cfg->has_proto && cfg->type != EV_TCP_EGRESS)
-			return 0;
-	}
+	pid = bpf_get_current_pid_tgid() >> 32;
 
 	fill_network_info(&net, sk, size);
-	if (cfg) {
-		if (cfg->exclude_local_src && is_loopback_v4(net.saddr[0]) && net.family == AF_INET)
-			return 0;
-		if (cfg->exclude_local_src && net.family == AF_INET6 && is_loopback_v6(net.saddr))
-			return 0;
-		if (cfg->exclude_local_dst && is_loopback_v4(net.daddr[0]) && net.family == AF_INET)
-			return 0;
-		if (cfg->exclude_local_dst && net.family == AF_INET6 && is_loopback_v6(net.daddr))
-			return 0;
-		if (!match_ip_filter_bpf(&cfg->src, &net, 1))
-			return 0;
-		if (!match_ip_filter_bpf(&cfg->dst, &net, 0))
-			return 0;
-		if (cfg->exclude_port_count) {
-			for (int i = 0; i < MAX_EXCLUDE_PORTS; i++) {
-				if (i >= cfg->exclude_port_count)
-					break;
-				if (net.sport == cfg->exclude_ports[i] || net.dport == cfg->exclude_ports[i])
-					return 0;
-			}
-		}
-	}
+	if (!filter_event(cfg, &net, pid, EV_TCP_EGRESS))
+		return 0;
 
 	struct event *e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);
 	if (!e)
@@ -228,19 +249,8 @@ int BPF_PROG(on_tcp_sendmsg,
 	e->tgid = (__u32)bpf_get_current_pid_tgid();
 	bpf_get_current_comm(&e->comm, sizeof(e->comm));
 	e->protocol = IPPROTO_TCP;
-	
-	e->family = net.family;
-	e->sport = net.sport;
-	e->dport = net.dport;
-	e->saddr[0] = net.saddr[0];
-	e->saddr[1] = net.saddr[1];
-	e->saddr[2] = net.saddr[2];
-	e->saddr[3] = net.saddr[3];
-	e->daddr[0] = net.daddr[0];
-	e->daddr[1] = net.daddr[1];
-	e->daddr[2] = net.daddr[2];
-	e->daddr[3] = net.daddr[3];
-	e->bytes_sent = net.bytes_sent;
+
+	copy_network_fields(e, &net);
 	
 	/* Look up hostname from DNS map */
 	struct dns_mapping_key dns_key = {0};
@@ -280,37 +290,11 @@ int BPF_PROG(on_udp_sendmsg,
 		return 0;
 
 	cfg = bpf_map_lookup_elem(&filter_config_map, &cfg_key);
-	if (cfg) {
-		pid = bpf_get_current_pid_tgid() >> 32;
-		if (cfg->has_pid && pid != cfg->pid)
-			return 0;
-		if (cfg->has_proto && cfg->type != EV_UDP_EGRESS)
-			return 0;
-	}
+	pid = bpf_get_current_pid_tgid() >> 32;
 
 	fill_network_info(&net, sk, len);
-	if (cfg) {
-		if (cfg->exclude_local_src && is_loopback_v4(net.saddr[0]) && net.family == AF_INET)
-			return 0;
-		if (cfg->exclude_local_src && net.family == AF_INET6 && is_loopback_v6(net.saddr))
-			return 0;
-		if (cfg->exclude_local_dst && is_loopback_v4(net.daddr[0]) && net.family == AF_INET)
-			return 0;
-		if (cfg->exclude_local_dst && net.family == AF_INET6 && is_loopback_v6(net.daddr))
-			return 0;
-		if (!match_ip_filter_bpf(&cfg->src, &net, 1))
-			return 0;
-		if (!match_ip_filter_bpf(&cfg->dst, &net, 0))
-			return 0;
-		if (cfg->exclude_port_count) {
-			for (int i = 0; i < MAX_EXCLUDE_PORTS; i++) {
-				if (i >= cfg->exclude_port_count)
-					break;
-				if (net.sport == cfg->exclude_ports[i] || net.dport == cfg->exclude_ports[i])
-					return 0;
-			}
-		}
-	}
+	if (!filter_event(cfg, &net, pid, EV_UDP_EGRESS))
+		return 0;
 
 	struct event *e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);
 	if (!e)
@@ -323,19 +307,8 @@ int BPF_PROG(on_udp_sendmsg,
 	e->tgid = (__u32)bpf_get_current_pid_tgid();
 	bpf_get_current_comm(&e->comm, sizeof(e->comm));
 	e->protocol = IPPROTO_UDP;
-	
-	e->family = net.family;
-	e->sport = net.sport;
-	e->dport = net.dport;
-	e->saddr[0] = net.saddr[0];
-	e->saddr[1] = net.saddr[1];
-	e->saddr[2] = net.saddr[2];
-	e->saddr[3] = net.saddr[3];
-	e->daddr[0] = net.daddr[0];
-	e->daddr[1] = net.daddr[1];
-	e->daddr[2] = net.daddr[2];
-	e->daddr[3] = net.daddr[3];
-	e->bytes_sent = net.bytes_sent;
+
+	copy_network_fields(e, &net);
 	
 	bpf_ringbuf_submit(e, 0);
 	return 0;
