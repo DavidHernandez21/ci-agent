@@ -117,6 +117,7 @@ static int parse_ip_filter(const char *s, struct ip_filter *out)
 	if (inet_pton(AF_INET6, s, buf) == 1) {
 		out->set = true;
 		out->family = AF_INET6;
+		/* Keep IPv6 words in network byte order to match BPF comparisons. */
 		memcpy(&out->addr[0], buf, sizeof(out->addr));
 		return 0;
 	}
@@ -124,14 +125,12 @@ static int parse_ip_filter(const char *s, struct ip_filter *out)
 	return -EINVAL;
 }
 
+/* Userspace only applies exe filtering; the rest is handled in BPF. */
 static bool match_event_filter(const struct event_filter *f,
-			       const struct event *e,
-			       const char *exe_display)
+		       const char *exe_display)
 {
 	if (f == NULL)
 		return true;
-
-	(void)e;
 
 	if (f->has_exe) {
 		if (exe_display == NULL || strcasestr(exe_display, f->exe) == NULL)
@@ -157,6 +156,26 @@ static int add_exclude_port(struct event_filter *filter, const char *s)
 		return -EINVAL;
 
 	filter->exclude_ports[filter->exclude_port_count++] = (__u16)port;
+	return 0;
+}
+
+static int parse_pid(const char *s, __u32 *out_pid)
+{
+	char *end = NULL;
+	unsigned long pid;
+
+	if (s == NULL || out_pid == NULL)
+		return -EINVAL;
+
+	if (s[0] == '-')
+		return -EINVAL;
+
+	errno = 0;
+	pid = strtoul(s, &end, 10);
+	if (end == s || *end != '\0' || errno == ERANGE || pid == 0 || pid > UINT32_MAX)
+		return -EINVAL;
+
+	*out_pid = (__u32)pid;
 	return 0;
 }
 
@@ -242,7 +261,7 @@ static int handle_event(void *ctx, void *data, size_t data_sz)
 		exe_display = e->comm;
 	}
 
-	if (!match_event_filter(filter, e, exe_display))
+	if (!match_event_filter(filter, exe_display))
 		return 0;
 
 	if (e->family == AF_INET) {
@@ -375,8 +394,12 @@ int main(int argc, char **argv)
 	while ((opt = getopt_long(argc, argv, "p:P:e:s:d:x:h", long_opts, &opt_index)) != -1) {
 		switch (opt) {
 			case 'p':
+				if (parse_pid(optarg, &filter.pid) != 0) {
+					fprintf(stderr, "invalid pid: %s\n", optarg);
+					print_usage(argv[0]);
+					return 1;
+				}
 				filter.has_pid = true;
-				filter.pid = (__u32)strtoul(optarg, NULL, 10);
 				break;
 			case 'P':
 				if (parse_proto(optarg, &filter.type) != 0) {
