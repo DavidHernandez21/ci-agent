@@ -358,10 +358,15 @@ static int update_bpf_filter_config(struct ci_agent_bpf *skel,
 	cfg.dst.loopback = filter->dst.loopback ? 1 : 0;
 	cfg.dst.family = filter->dst.family;
 	memcpy(cfg.dst.addr, filter->dst.addr, sizeof(cfg.dst.addr));
-	if (filter->exclude_port_count > MAX_EXCLUDE_PORTS)
+	if (filter->exclude_port_count > MAX_EXCLUDE_PORTS) {
+		fprintf(stderr,
+			"Warning: %zu exclude ports provided; only the first %d will be applied\n",
+			filter->exclude_port_count,
+			MAX_EXCLUDE_PORTS);
 		cfg.exclude_port_count = MAX_EXCLUDE_PORTS;
-	else
+	} else {
 		cfg.exclude_port_count = (unsigned char)filter->exclude_port_count;
+	}
 	for (size_t i = 0; i < cfg.exclude_port_count; i++)
 		cfg.exclude_ports[i] = filter->exclude_ports[i];
 
@@ -428,10 +433,16 @@ int main(int argc, char **argv)
 				}
 				break;
 			case 'x':
-				if (add_exclude_port(&filter, optarg) != 0) {
-					fprintf(stderr, "invalid port: %s\n", optarg);
-					print_usage(argv[0]);
-					return 1;
+				{
+					int r = add_exclude_port(&filter, optarg);
+					if (r != 0) {
+						if (r == -ENOSPC)
+							fprintf(stderr, "too many --no-port options (max %d)\n", MAX_EXCLUDE_PORTS);
+						else
+							fprintf(stderr, "invalid port: %s\n", optarg);
+						print_usage(argv[0]);
+						return 1;
+					}
 				}
 				break;
 			case 1:
@@ -454,32 +465,35 @@ int main(int argc, char **argv)
 
 	libbpf_set_strict_mode(LIBBPF_STRICT_ALL);
 
+	int exit_code = 1;
+	int err;
+	bool dns_started = false;
+	int ep_fd = -1;
+	struct ring_buffer *rb = NULL;
 	struct ci_agent_broadcaster *broadcaster = NULL;
-	int err = ci_agent_broadcaster_init(&broadcaster, "/run/ci-agent.sock");
-	if (err != 0)
-	{
+	struct ci_agent_bpf *skel = NULL;
+
+	err = ci_agent_broadcaster_init(&broadcaster, "/run/ci-agent.sock");
+	if (err != 0) {
 		fprintf(stderr, "initializing listener failed: %s\n", strerror(-err));
-		return 1;
+		goto out;
 	}
 
-	struct ci_agent_bpf *skel = ci_agent_bpf__open();
+	skel = ci_agent_bpf__open();
 	if (!skel) {
 		fprintf(stderr, "open skeleton failed: %s\n", strerror(errno));
-		return 1;
+		goto out;
 	}
 	err = ci_agent_bpf__load(skel);
 	if (err) {
 		fprintf(stderr, "load failed: %s\n", strerror(-err));
-		ci_agent_bpf__destroy(skel);
-		return 1;
+		goto out;
 	}
 
 	err = update_bpf_filter_config(skel, &filter);
 	if (err) {
 		fprintf(stderr, "setting BPF filter failed: %s\n", strerror(-err));
-		ci_agent_bpf__destroy(skel);
-		ci_agent_broadcaster_fini(broadcaster);
-		return 1;
+		goto out;
 	}
 	err = ci_agent_bpf__attach(skel);
 	if (err) {
@@ -487,9 +501,7 @@ int main(int argc, char **argv)
 		fprintf(stderr, "Note: If a previous instance was killed, you may need to:\n");
 		fprintf(stderr, "  1. Wait a few seconds for kernel to clean up\n");
 		fprintf(stderr, "  2. Or reboot to clear stuck BPF attachments\n");
-		ci_agent_bpf__destroy(skel);
-		ci_agent_broadcaster_fini(broadcaster);
-		return 1;
+		goto out;
 	}
 
 	fprintf(stderr, "ci-agentd started successfully\n");
@@ -498,6 +510,7 @@ int main(int argc, char **argv)
 	int dns_map_fd = bpf_map__fd(skel->maps.dns_map);
 	if (dns_map_fd >= 0) {
 		if (dns_sniffer_start(dns_map_fd) == 0) {
+			dns_started = true;
 			fprintf(stderr, "DNS sniffer started\n");
 		} else {
 			fprintf(stderr, "Warning: DNS sniffer failed to start (need CAP_NET_RAW)\n");
@@ -510,52 +523,38 @@ int main(int argc, char **argv)
 		.filter = filter,
 	};
 
-	struct ring_buffer *rb =
-	    ring_buffer__new(bpf_map__fd(skel->maps.events),
-			     handle_event, &handler_ctx, NULL);
+	rb = ring_buffer__new(bpf_map__fd(skel->maps.events),
+			 handle_event, &handler_ctx, NULL);
 	if (!rb) {
 		fprintf(stderr, "ring_buffer__new: %s\n", strerror(errno));
-		ci_agent_bpf__destroy(skel);
-		ci_agent_broadcaster_fini(broadcaster);
-		return 1;
+		goto out;
 	}
 
 	int rb_fd = ring_buffer__epoll_fd(rb);
 	if (rb_fd < 0)
 	{
 		fprintf(stderr, "ring_buffer__epoll_fd: %s\n", strerror(errno));
-		ring_buffer__free(rb);
-		ci_agent_bpf__destroy(skel);
-		ci_agent_broadcaster_fini(broadcaster);
-		return 1;
+		goto out;
 	}
 
-	int ep_fd = epoll_create1(EPOLL_CLOEXEC);
+	ep_fd = epoll_create1(EPOLL_CLOEXEC);
 	if (ep_fd < 0)
 	{
 		fprintf(stderr, "epoll_create1: %s\n", strerror(errno));
-		ring_buffer__free(rb);
-		ci_agent_bpf__destroy(skel);
-		ci_agent_broadcaster_fini(broadcaster);
-		return 1;
+		goto out;
 	}
 
 	if (eventloop_register(ep_fd, rb_fd, FD_RINGBUF) < 0)
 	{
-		ring_buffer__free(rb);
-		ci_agent_bpf__destroy(skel);
-		ci_agent_broadcaster_fini(broadcaster);
-		return 1;
+		fprintf(stderr, "epoll_ctl ringbuf: %s\n", strerror(errno));
+		goto out;
 	}
 
 	int lfd = ci_agent_broadcaster_fd(broadcaster);
 	if (eventloop_register(ep_fd, lfd, FD_LISTENER) < 0)
 	{
 		fprintf(stderr, "epoll_ctl listener: %s\n", strerror(errno));
-		ring_buffer__free(rb);
-		ci_agent_bpf__destroy(skel);
-		ci_agent_broadcaster_fini(broadcaster);
-		return 1;
+		goto out;
 	}
 
 	while (!stop) {
@@ -603,10 +602,19 @@ int main(int argc, char **argv)
 
 	fprintf(stderr, "ci-agentd shutting down...\n");
 
-	dns_sniffer_stop_thread();
-	ring_buffer__free(rb);
-	ci_agent_bpf__destroy(skel);
-	ci_agent_broadcaster_fini(broadcaster);
+	exit_code = 0;
 
-	return 0;
+out:
+	if (dns_started)
+		dns_sniffer_stop_thread();
+	if (ep_fd >= 0)
+		close(ep_fd);
+	if (rb)
+		ring_buffer__free(rb);
+	if (skel)
+		ci_agent_bpf__destroy(skel);
+	if (broadcaster)
+		ci_agent_broadcaster_fini(broadcaster);
+
+	return exit_code;
 }
