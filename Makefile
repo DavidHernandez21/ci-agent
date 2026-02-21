@@ -1,18 +1,21 @@
 all: ci-agentd
 
-CC ?= gcc
+# Toolchain (override with `make CC=clang`, etc.)
+CC ?= cc
+BPF_CLANG ?= clang
+BPFTOOL ?= bpftool
 
 BPF_HEADERS = vmlinux.h
 
 vmlinux.h:
-	bpftool btf dump file /sys/kernel/btf/vmlinux format c > $@
+	$(BPFTOOL) btf dump file /sys/kernel/btf/vmlinux format c > $@
 
 BPF_OBJS = ci-agent.bpf.o
 
 $(BPF_OBJS): $(BPF_HEADERS)
 
 %.bpf.o: %.bpf.c
-	clang -O2 -g -Wall -target bpf -D__TARGET_ARCH_x86 -c $< -o $@
+	$(BPF_CLANG) -O2 -g -Wall -target bpf -D__TARGET_ARCH_x86 -c $< -o $@
 
 ALL_HEADERS += $(BPF_HEADERS)
 ALL_OBJS += $(BPF_OBJS)
@@ -25,7 +28,7 @@ ALL_HEADERS += $(AGENT_HEADERS)
 ALL_OBJS += $(AGENT_OBJS)
 
 %.skel.h: %.bpf.o
-	bpftool gen skeleton $< > $@
+	$(BPFTOOL) gen skeleton $< > $@
 
 $(AGENT_OBJS): $(AGENT_HEADERS)
 
