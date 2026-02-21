@@ -416,7 +416,16 @@ int main(int argc, char **argv)
 				break;
 			case 'e':
 				filter.has_exe = true;
-				snprintf(filter.exe, sizeof(filter.exe), "%s", optarg);
+				{
+					size_t n = strnlen(optarg, sizeof(filter.exe));
+					if (n >= sizeof(filter.exe)) {
+						fprintf(stderr, "exe substring too long (max %zu bytes)\n", sizeof(filter.exe) - 1);
+						print_usage(argv[0]);
+						return 1;
+					}
+					memcpy(filter.exe, optarg, n);
+					filter.exe[n] = '\0';
+				}
 				break;
 			case 's':
 				if (parse_ip_filter(optarg, &filter.src) != 0) {
