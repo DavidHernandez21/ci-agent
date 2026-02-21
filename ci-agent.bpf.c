@@ -226,7 +226,7 @@ int BPF_PROG(on_tcp_sendmsg,
 	struct bpf_filter_config *cfg;
 	__u32 cfg_key = 0;
 	__u32 pid;
-	struct event net = {};
+	struct event temp_event = {};
 
 	if (!sk)
 		return 0;
@@ -234,8 +234,8 @@ int BPF_PROG(on_tcp_sendmsg,
 	cfg = bpf_map_lookup_elem(&filter_config_map, &cfg_key);
 	pid = bpf_get_current_pid_tgid() >> 32;
 
-	fill_network_info(&net, sk, size);
-	if (!filter_event(cfg, &net, pid, EV_TCP_EGRESS))
+	fill_network_info(&temp_event, sk, size);
+	if (!filter_event(cfg, &temp_event, pid, EV_TCP_EGRESS))
 		return 0;
 
 	struct event *e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);
@@ -250,7 +250,7 @@ int BPF_PROG(on_tcp_sendmsg,
 	bpf_get_current_comm(&e->comm, sizeof(e->comm));
 	e->protocol = IPPROTO_TCP;
 
-	copy_network_fields(e, &net);
+	copy_network_fields(e, &temp_event);
 	
 	/* Look up hostname from DNS map */
 	struct dns_mapping_key dns_key = {0};
@@ -284,7 +284,7 @@ int BPF_PROG(on_udp_sendmsg,
 	struct bpf_filter_config *cfg;
 	__u32 cfg_key = 0;
 	__u32 pid;
-	struct event net = {};
+	struct event temp_event = {};
 
 	if (!sk)
 		return 0;
@@ -292,8 +292,8 @@ int BPF_PROG(on_udp_sendmsg,
 	cfg = bpf_map_lookup_elem(&filter_config_map, &cfg_key);
 	pid = bpf_get_current_pid_tgid() >> 32;
 
-	fill_network_info(&net, sk, len);
-	if (!filter_event(cfg, &net, pid, EV_UDP_EGRESS))
+	fill_network_info(&temp_event, sk, len);
+	if (!filter_event(cfg, &temp_event, pid, EV_UDP_EGRESS))
 		return 0;
 
 	struct event *e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);
@@ -308,7 +308,7 @@ int BPF_PROG(on_udp_sendmsg,
 	bpf_get_current_comm(&e->comm, sizeof(e->comm));
 	e->protocol = IPPROTO_UDP;
 
-	copy_network_fields(e, &net);
+	copy_network_fields(e, &temp_event);
 	
 	bpf_ringbuf_submit(e, 0);
 	return 0;
