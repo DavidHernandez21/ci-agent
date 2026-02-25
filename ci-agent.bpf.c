@@ -241,28 +241,14 @@ int BPF_PROG(on_tcp_sendmsg,
 
 	copy_network_fields(e, &temp_event);
 	
-	/* Look up hostname from DNS map */
-	struct dns_mapping_key dns_key = {0};
-	if (e->family == AF_INET) {
-		dns_key.ip[0] = e->daddr[0];
-		dns_key.family = AF_INET;
-	} else if (e->family == AF_INET6) {
-		dns_key.ip[0] = e->daddr[0];
-		dns_key.ip[1] = e->daddr[1];
-		dns_key.ip[2] = e->daddr[2];
-		dns_key.ip[3] = e->daddr[3];
-		dns_key.family = AF_INET6;
-	}
-	
-	/* Note: We can't store hostname in event struct directly in BPF */
-	/* Userspace will look it up from the map */
+	/* Hostname lookup happens in userspace using dns_map. */
 	
 	bpf_ringbuf_submit(e, 0);
 	return 0;
 }
 
-/* DNS capture is done in userspace (ci-agentd-dns.c) */
-/* The DNS map is populated by userspace and read by BPF hooks below */
+/* DNS capture and dns_map population are done in userspace (ci-agentd-dns.c). */
+/* BPF only emits IPs; userspace performs the dns_map lookup. */
 
 SEC("fentry/udp_sendmsg")
 int BPF_PROG(on_udp_sendmsg,
