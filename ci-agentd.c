@@ -3,9 +3,11 @@
 #include <getopt.h>
 #include <signal.h>
 #include <stdbool.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <arpa/inet.h>
 #include <unistd.h>
 #include <limits.h>
@@ -22,6 +24,11 @@
 enum fd_tag {
 	FD_RINGBUF = 1,
 	FD_LISTENER = 2,
+};
+
+enum summary_sort_by {
+	SUMMARY_SORT_COUNT = 0,
+	SUMMARY_SORT_BYTES = 1,
 };
 
 static volatile sig_atomic_t stop;
@@ -66,6 +73,8 @@ static void print_usage(const char *argv0)
 		"  -s, --src <ip>          Match source IP (IPv4/IPv6) or 'local' for loopback\n"
 		"  -d, --dst <ip>          Match destination IP (IPv4/IPv6) or 'local' for loopback\n"
 		"  -x, --no-port <port>    Exclude events with source or destination port\n"
+		"  -S, --summarize <dur>   Run for duration and emit a summary (e.g., 10s, 500ms, 2m)\n"
+		"  -o, --sort-by <key>     Summary sort key with --summarize: count|bytes (default: count)\n"
 		"      --no-local-src      Exclude loopback as source (127.0.0.0/8, ::1)\n"
 		"      --no-local-dst      Exclude loopback as destination (127.0.0.0/8, ::1)\n"
 		"  -h, --help              Show this help\n",
@@ -193,6 +202,124 @@ static void format_ipv6(char *buf, size_t len, const __u32 *addr)
 	inet_ntop(AF_INET6, &in6, buf, len);
 }
 
+struct summary_key {
+	__u32 pid;
+	__u32 type;
+	__u8 family;
+	__u16 dport;
+	__u32 saddr[4];
+	__u32 daddr[4];
+	char exe[PATH_MAX];
+};
+
+struct summary_val {
+	unsigned long long count;
+	unsigned long long bytes;
+};
+
+struct summary_entry {
+	bool in_use;
+	struct summary_key key;
+	struct summary_val val;
+};
+
+struct summary_table {
+	struct summary_entry *entries;
+	size_t cap;
+	size_t len;
+};
+
+static unsigned long long fnv1a_hash(const void *data, size_t len)
+{
+	const unsigned char *bytes = data;
+	unsigned long long hash = 1469598103934665603ULL;
+
+	for (size_t i = 0; i < len; i++) {
+		hash ^= (unsigned long long)bytes[i];
+		hash *= 1099511628211ULL;
+	}
+
+	return hash;
+}
+
+static bool summary_key_equal(const struct summary_key *a, const struct summary_key *b)
+{
+	return memcmp(a, b, sizeof(*a)) == 0;
+}
+
+static int summary_table_grow(struct summary_table *table, size_t new_cap)
+{
+	struct summary_entry *new_entries = calloc(new_cap, sizeof(*new_entries));
+	if (new_entries == NULL)
+		return -ENOMEM;
+
+	for (size_t i = 0; i < table->cap; i++) {
+		struct summary_entry *entry = &table->entries[i];
+		if (!entry->in_use)
+			continue;
+
+		unsigned long long hash = fnv1a_hash(&entry->key, sizeof(entry->key));
+		size_t idx = (size_t)(hash & (new_cap - 1));
+		while (new_entries[idx].in_use) {
+			idx = (idx + 1) & (new_cap - 1);
+		}
+		new_entries[idx] = *entry;
+	}
+
+	free(table->entries);
+	table->entries = new_entries;
+	table->cap = new_cap;
+	return 0;
+}
+
+static int summary_table_init(struct summary_table *table)
+{
+	if (table == NULL)
+		return -EINVAL;
+
+	memset(table, 0, sizeof(*table));
+	return summary_table_grow(table, 256);
+}
+
+static void summary_table_free(struct summary_table *table)
+{
+	if (table == NULL)
+		return;
+
+	free(table->entries);
+	memset(table, 0, sizeof(*table));
+}
+
+static struct summary_entry *summary_table_get_or_add(struct summary_table *table,
+						  const struct summary_key *key)
+{
+	if (table == NULL || key == NULL)
+		return NULL;
+
+	if (table->cap == 0 && summary_table_init(table) != 0)
+		return NULL;
+
+	if ((table->len + 1) * 100 >= table->cap * 70) {
+		if (summary_table_grow(table, table->cap * 2) != 0)
+			return NULL;
+	}
+
+	unsigned long long hash = fnv1a_hash(key, sizeof(*key));
+	size_t idx = (size_t)(hash & (table->cap - 1));
+	while (table->entries[idx].in_use) {
+		if (summary_key_equal(&table->entries[idx].key, key))
+			return &table->entries[idx];
+		idx = (idx + 1) & (table->cap - 1);
+	}
+
+	table->entries[idx].in_use = true;
+	table->entries[idx].key = *key;
+	table->entries[idx].val.count = 0;
+	table->entries[idx].val.bytes = 0;
+	table->len++;
+	return &table->entries[idx];
+}
+
 static int get_executable_path(pid_t pid, char *buf, size_t len)
 {
 	char path[64];
@@ -213,6 +340,8 @@ struct event_handler_ctx {
 	struct ci_agent_broadcaster *broadcaster;
 	struct bpf_map *dns_map;
 	struct event_filter filter;
+	struct summary_table *summary;
+	bool summarize;
 };
 
 static int eventloop_register(int ep_fd, int fd, enum fd_tag tag)
@@ -231,6 +360,7 @@ static int handle_event(void *ctx, void *data, size_t data_sz)
 	struct ci_agent_broadcaster *broadcaster = handler_ctx->broadcaster;
 	struct bpf_map *dns_map = handler_ctx->dns_map;
 	const struct event_filter *filter = &handler_ctx->filter;
+	struct summary_table *summary = handler_ctx->summary;
 	char saddr_str[INET6_ADDRSTRLEN];
 	char daddr_str[INET6_ADDRSTRLEN];
 	char exe_path[PATH_MAX];
@@ -263,6 +393,28 @@ static int handle_event(void *ctx, void *data, size_t data_sz)
 
 	if (!match_event_filter(filter, exe_display))
 		return 0;
+
+	if (handler_ctx->summarize) {
+		struct summary_key key;
+		struct summary_entry *entry;
+
+		memset(&key, 0, sizeof(key));
+		key.pid = e->pid;
+		key.type = e->type;
+		key.family = e->family;
+		key.dport = e->dport;
+		memcpy(key.saddr, e->saddr, sizeof(key.saddr));
+		memcpy(key.daddr, e->daddr, sizeof(key.daddr));
+		snprintf(key.exe, sizeof(key.exe), "%s", exe_display);
+
+		entry = summary_table_get_or_add(summary, &key);
+		if (entry != NULL) {
+			entry->val.count++;
+			entry->val.bytes += (unsigned long long)e->bytes_sent;
+		}
+
+		return 0;
+	}
 
 	if (e->family == AF_INET) {
 		format_ipv4(saddr_str, sizeof(saddr_str), e->saddr[0]);
@@ -377,11 +529,182 @@ static int update_bpf_filter_config(struct ci_agent_bpf *skel,
 	return bpf_map_update_elem(map_fd, &key, &cfg, BPF_ANY);
 }
 
+static int parse_duration_ms(const char *s, unsigned long long *out_ms)
+{
+	char *end = NULL;
+	unsigned long long value;
+	unsigned long long multiplier = 1000ULL;
+
+	if (s == NULL || out_ms == NULL)
+		return -EINVAL;
+
+	value = strtoull(s, &end, 10);
+	if (end == s || value == 0)
+		return -EINVAL;
+
+	if (*end == '\0') {
+		multiplier = 1000ULL;
+	} else if (strcmp(end, "ms") == 0) {
+		multiplier = 1ULL;
+	} else if (strcmp(end, "s") == 0) {
+		multiplier = 1000ULL;
+	} else if (strcmp(end, "m") == 0) {
+		multiplier = 60ULL * 1000ULL;
+	} else if (strcmp(end, "h") == 0) {
+		multiplier = 60ULL * 60ULL * 1000ULL;
+	} else {
+		return -EINVAL;
+	}
+
+	*out_ms = value * multiplier;
+	if (*out_ms == 0)
+		return -EINVAL;
+
+	return 0;
+}
+
+static int parse_sort_by(const char *s, enum summary_sort_by *out)
+{
+	if (s == NULL || out == NULL)
+		return -EINVAL;
+
+	if (strcasecmp(s, "count") == 0) {
+		*out = SUMMARY_SORT_COUNT;
+		return 0;
+	}
+	if (strcasecmp(s, "bytes") == 0) {
+		*out = SUMMARY_SORT_BYTES;
+		return 0;
+	}
+
+	return -EINVAL;
+}
+
+static unsigned long long get_mono_ms(void)
+{
+	struct timespec ts;
+
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return (unsigned long long)ts.tv_sec * 1000ULL +
+	       (unsigned long long)ts.tv_nsec / 1000000ULL;
+}
+
+static void emit_summary_line(struct ci_agent_broadcaster *broadcaster, const char *fmt, ...)
+{
+	char buf[8192];
+	va_list va;
+	int len;
+
+	va_start(va, fmt);
+	len = vsnprintf(buf, sizeof(buf), fmt, va);
+	va_end(va);
+
+	if (len < 0)
+		return;
+
+	if (broadcaster != NULL)
+		ci_agent_broadcaster_send(broadcaster, "%s", buf);
+
+	fputs(buf, stdout);
+}
+
+static int summary_cmp_count(const void *a, const void *b)
+{
+	const struct summary_entry *ea = *(const struct summary_entry * const *)a;
+	const struct summary_entry *eb = *(const struct summary_entry * const *)b;
+
+	if (ea->val.count < eb->val.count)
+		return 1;
+	if (ea->val.count > eb->val.count)
+		return -1;
+	return 0;
+}
+
+static int summary_cmp_bytes(const void *a, const void *b)
+{
+	const struct summary_entry *ea = *(const struct summary_entry * const *)a;
+	const struct summary_entry *eb = *(const struct summary_entry * const *)b;
+
+	if (ea->val.bytes < eb->val.bytes)
+		return 1;
+	if (ea->val.bytes > eb->val.bytes)
+		return -1;
+	return 0;
+}
+
+static void emit_summary(struct summary_table *table,
+				 struct ci_agent_broadcaster *broadcaster,
+				 enum summary_sort_by sort_by,
+				 const char *duration_label)
+{
+	if (table == NULL)
+		return;
+
+	struct summary_entry **items = NULL;
+	if (table->len > 0) {
+		items = calloc(table->len, sizeof(*items));
+		if (items == NULL)
+			return;
+	}
+
+	size_t idx = 0;
+	for (size_t i = 0; i < table->cap; i++) {
+		if (!table->entries[i].in_use)
+			continue;
+		items[idx++] = &table->entries[i];
+	}
+
+	if (idx > 1) {
+		if (sort_by == SUMMARY_SORT_BYTES)
+			qsort(items, idx, sizeof(*items), summary_cmp_bytes);
+		else
+			qsort(items, idx, sizeof(*items), summary_cmp_count);
+	}
+
+	emit_summary_line(broadcaster, "SUMMARY interval=%s entries=%zu sort-by=%s\n",
+			duration_label ? duration_label : "unknown",
+			idx,
+			sort_by == SUMMARY_SORT_BYTES ? "bytes" : "count");
+
+	for (size_t i = 0; i < idx; i++) {
+		const struct summary_entry *entry = items[i];
+		char saddr_str[INET6_ADDRSTRLEN];
+		char daddr_str[INET6_ADDRSTRLEN];
+		const char *proto_str = entry->key.type == EV_TCP_EGRESS ? "TCP" : "UDP";
+
+		if (entry->key.family == AF_INET) {
+			format_ipv4(saddr_str, sizeof(saddr_str), entry->key.saddr[0]);
+			format_ipv4(daddr_str, sizeof(daddr_str), entry->key.daddr[0]);
+		} else {
+			format_ipv6(saddr_str, sizeof(saddr_str), entry->key.saddr);
+			format_ipv6(daddr_str, sizeof(daddr_str), entry->key.daddr);
+		}
+
+		emit_summary_line(broadcaster,
+			"pid=%u proto=%s exe=%s src=%s dst=%s dport=%u count=%llu bytes=%llu\n",
+			entry->key.pid,
+			proto_str,
+			entry->key.exe,
+			saddr_str,
+			daddr_str,
+			entry->key.dport,
+			entry->val.count,
+			entry->val.bytes);
+	}
+
+	free(items);
+}
+
 int main(int argc, char **argv)
 {
 	struct event_filter filter = {0};
+	struct summary_table summary_table = {0};
 	int opt;
 	int opt_index = 0;
+	bool summarize = false;
+	unsigned long long summarize_ms = 0;
+	const char *summarize_label = NULL;
+	enum summary_sort_by sort_by = SUMMARY_SORT_COUNT;
 
 	static struct option long_opts[] = {
 		{"pid", required_argument, NULL, 'p'},
@@ -390,13 +713,15 @@ int main(int argc, char **argv)
 		{"src", required_argument, NULL, 's'},
 		{"dst", required_argument, NULL, 'd'},
 		{"no-port", required_argument, NULL, 'x'},
+		{"summarize", required_argument, NULL, 'S'},
+		{"sort-by", required_argument, NULL, 'o'},
 		{"no-local-src", no_argument, NULL, 1},
 		{"no-local-dst", no_argument, NULL, 2},
 		{"help", no_argument, NULL, 'h'},
 		{NULL, 0, NULL, 0},
 	};
 
-	while ((opt = getopt_long(argc, argv, "p:P:e:s:d:x:h", long_opts, &opt_index)) != -1) {
+	while ((opt = getopt_long(argc, argv, "p:P:e:s:d:x:S:o:h", long_opts, &opt_index)) != -1) {
 		switch (opt) {
 			case 'p':
 				if (parse_pid(optarg, &filter.pid) != 0) {
@@ -452,6 +777,22 @@ int main(int argc, char **argv)
 						print_usage(argv[0]);
 						return 1;
 					}
+				}
+				break;
+			case 'S':
+				if (parse_duration_ms(optarg, &summarize_ms) != 0) {
+					fprintf(stderr, "invalid summarize duration: %s\n", optarg);
+					print_usage(argv[0]);
+					return 1;
+				}
+				summarize = true;
+				summarize_label = optarg;
+				break;
+			case 'o':
+				if (parse_sort_by(optarg, &sort_by) != 0) {
+					fprintf(stderr, "invalid sort key: %s\n", optarg);
+					print_usage(argv[0]);
+					return 1;
 				}
 				break;
 			case 1:
@@ -530,6 +871,8 @@ int main(int argc, char **argv)
 		.broadcaster = broadcaster,
 		.dns_map = skel->maps.dns_map,
 		.filter = filter,
+		.summary = &summary_table,
+		.summarize = summarize,
 	};
 
 	rb = ring_buffer__new(bpf_map__fd(skel->maps.events),
@@ -566,10 +909,26 @@ int main(int argc, char **argv)
 		goto out;
 	}
 
+	unsigned long long deadline_ms = 0;
+	if (summarize)
+		deadline_ms = get_mono_ms() + summarize_ms;
+
 	while (!stop) {
 		struct epoll_event events[8];
+		int timeout_ms = -1;
 
-		int n = epoll_wait(ep_fd, events, 8, -1);
+		if (summarize) {
+			unsigned long long now = get_mono_ms();
+			if (now >= deadline_ms)
+				break;
+			unsigned long long remaining = deadline_ms - now;
+			if (remaining > (unsigned long long)INT_MAX)
+				timeout_ms = INT_MAX;
+			else
+				timeout_ms = (int)remaining;
+		}
+
+		int n = epoll_wait(ep_fd, events, 8, timeout_ms);
 		if (n < 0)
 		{
 			if (errno == EINTR) {
@@ -609,9 +968,16 @@ int main(int argc, char **argv)
 		}
 	}
 
+	if (summarize)
+		emit_summary(&summary_table, broadcaster, sort_by, summarize_label);
+
 	fprintf(stderr, "ci-agentd shutting down...\n");
 
-	exit_code = 0;
+	dns_sniffer_stop_thread();
+	ring_buffer__free(rb);
+	ci_agent_bpf__destroy(skel);
+	ci_agent_broadcaster_fini(broadcaster);
+	summary_table_free(&summary_table);
 
 out:
 	if (dns_started)

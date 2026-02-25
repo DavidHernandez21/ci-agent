@@ -15,6 +15,8 @@ sudo ./ci-agentd --src local            # Match loopback (127.0.0.0/8, ::1)
 sudo ./ci-agentd --no-local-src         # Exclude loopback source traffic
 sudo ./ci-agentd --no-local-dst         # Exclude loopback destination traffic
 sudo ./ci-agentd --no-port 22           # Exclude events with port 22 (src or dst)
+sudo ./ci-agentd --summarize 10s        # Run for 10s and emit a summary keyed by pid, proto, exe, src_ip, dst_ip, dst_port. Exits after emitting summary.
+sudo ./ci-agentd --summarize 10s --sort-by bytes  # Summary sorted by total bytes (only with --summarize)
 nc -U /run/ci-agent.sock                # View logs (in another terminal)
 dig google.com                          # Test DNS capture
 curl https://www.github.com             # Generate traffic
