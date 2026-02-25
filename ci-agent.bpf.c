@@ -2,6 +2,7 @@
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_tracing.h>
 #include <bpf/bpf_core_read.h>
+#include <bpf/bpf_endian.h>
 #include "ci-agent.h"
 
 /* Socket address families */
@@ -46,19 +47,6 @@ struct {
 	__type(key, __u32);
 	__type(value, struct bpf_filter_config);
 } filter_config_map SEC(".maps");
-
-static __always_inline __u16 bpf_ntohs(__u16 val)
-{
-	return ((val & 0x00ff) << 8) | ((val & 0xff00) >> 8);
-}
-
-static __always_inline __u32 bpf_ntohl(__u32 val)
-{
-	return ((val & 0x000000ff) << 24) |
-	       ((val & 0x0000ff00) << 8) |
-	       ((val & 0x00ff0000) >> 8) |
-	       ((val & 0xff000000) >> 24);
-}
 
 static __always_inline void fill_network_info(struct event *e, struct sock *sk, size_t size)
 {
@@ -121,6 +109,7 @@ static __always_inline void fill_network_info(struct event *e, struct sock *sk, 
 
 static __always_inline int is_loopback_v4(__u32 addr)
 {
+	/* addr is host-order __u32 (output of bpf_ntohl()). */
 	return (addr & 0xff000000) == 0x7f000000;
 }
 

@@ -7,6 +7,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <time.h>
 #include <arpa/inet.h>
 #include <unistd.h>
@@ -538,8 +539,9 @@ static int parse_duration_ms(const char *s, unsigned long long *out_ms)
 	if (s == NULL || out_ms == NULL)
 		return -EINVAL;
 
+	errno = 0;
 	value = strtoull(s, &end, 10);
-	if (end == s || value == 0)
+	if (end == s || value == 0 || errno == ERANGE)
 		return -EINVAL;
 
 	if (*end == '\0') {
@@ -556,6 +558,8 @@ static int parse_duration_ms(const char *s, unsigned long long *out_ms)
 		return -EINVAL;
 	}
 
+	if (value > ULLONG_MAX / multiplier)
+		return -EINVAL;
 	*out_ms = value * multiplier;
 	if (*out_ms == 0)
 		return -EINVAL;
@@ -973,13 +977,10 @@ int main(int argc, char **argv)
 
 	fprintf(stderr, "ci-agentd shutting down...\n");
 
-	dns_sniffer_stop_thread();
-	ring_buffer__free(rb);
-	ci_agent_bpf__destroy(skel);
-	ci_agent_broadcaster_fini(broadcaster);
-	summary_table_free(&summary_table);
+	exit_code = 0;
 
 out:
+	summary_table_free(&summary_table);
 	if (dns_started)
 		dns_sniffer_stop_thread();
 	if (ep_fd >= 0)
