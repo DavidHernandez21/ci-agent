@@ -203,6 +203,8 @@ static void format_ipv6(char *buf, size_t len, const __u32 *addr)
 	inet_ntop(AF_INET6, &in6, buf, len);
 }
 
+enum { SUMMARY_EXE_MAX = 256 };
+
 struct summary_key {
 	__u32 pid;
 	__u32 type;
@@ -210,7 +212,7 @@ struct summary_key {
 	__u16 dport;
 	__u32 saddr[4];
 	__u32 daddr[4];
-	char exe[PATH_MAX];
+	char exe[SUMMARY_EXE_MAX];
 };
 
 struct summary_val {
@@ -406,7 +408,9 @@ static int handle_event(void *ctx, void *data, size_t data_sz)
 		key.dport = e->dport;
 		memcpy(key.saddr, e->saddr, sizeof(key.saddr));
 		memcpy(key.daddr, e->daddr, sizeof(key.daddr));
-		snprintf(key.exe, sizeof(key.exe), "%s", exe_display);
+		snprintf(key.exe, sizeof(key.exe), "%.*s",
+			 (int)(sizeof(key.exe) - 1),
+			 exe_display);
 
 		entry = summary_table_get_or_add(summary, &key);
 		if (entry != NULL) {
