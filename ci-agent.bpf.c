@@ -185,10 +185,10 @@ static __always_inline int filter_event(const struct bpf_filter_config *cfg,
 	if (!match_ip_filter_bpf(&cfg->dst, net, 0))
 		return 0;
 	if (cfg->exclude_port_count) {
+		#pragma unroll
 		for (int i = 0; i < MAX_EXCLUDE_PORTS; i++) {
-			if (i >= cfg->exclude_port_count)
-				break;
-			if (net->sport == cfg->exclude_ports[i] || net->dport == cfg->exclude_ports[i])
+			if (i < cfg->exclude_port_count &&
+			    (net->sport == cfg->exclude_ports[i] || net->dport == cfg->exclude_ports[i]))
 				return 0;
 		}
 	}
