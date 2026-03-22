@@ -542,7 +542,9 @@ static int update_bpf_filter_config(struct ci_agent_bpf *skel,
 	if (map_fd < 0)
 		return -EINVAL;
 
-	return bpf_map_update_elem(map_fd, &key, &cfg, BPF_ANY);
+	if (bpf_map_update_elem(map_fd, &key, &cfg, BPF_ANY) != 0)
+		return -errno;
+	return 0;
 }
 
 static int parse_duration_ms(const char *s, unsigned long long *out_ms)
