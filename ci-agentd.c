@@ -4,6 +4,7 @@
 #include <signal.h>
 #include <stdbool.h>
 #include <stdarg.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -161,6 +162,7 @@ static int add_exclude_port(struct event_filter *filter, const char *s)
 	if (filter->exclude_port_count >= MAX_EXCLUDE_PORTS)
 		return -ENOSPC;
 
+	errno = 0;
 	port = strtoul(s, &end, 10);
 	if (end == s || *end != '\0' || port == 0 || port > 65535)
 		return -EINVAL;
@@ -252,6 +254,13 @@ static bool summary_key_equal(const struct summary_key *a, const struct summary_
 
 static int summary_table_grow(struct summary_table *table, size_t new_cap)
 {
+	if (table == NULL)
+		return -EINVAL;
+	if (new_cap == 0)
+		return -EINVAL;
+	if (new_cap > (SIZE_MAX / sizeof(struct summary_entry)))
+		return -EOVERFLOW;
+
 	struct summary_entry *new_entries = calloc(new_cap, sizeof(*new_entries));
 	if (new_entries == NULL)
 		return -ENOMEM;
@@ -303,6 +312,8 @@ static struct summary_entry *summary_table_get_or_add(struct summary_table *tabl
 		return NULL;
 
 	if ((table->len + 1) * 100 >= table->cap * 70) {
+		if (table->cap > (SIZE_MAX / 2))
+			return NULL;
 		if (summary_table_grow(table, table->cap * 2) != 0)
 			return NULL;
 	}
