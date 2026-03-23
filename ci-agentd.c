@@ -528,15 +528,7 @@ static int update_bpf_filter_config(struct ci_agent_bpf *skel,
 	cfg.dst.loopback = filter->dst.loopback ? 1 : 0;
 	cfg.dst.family = filter->dst.family;
 	memcpy(cfg.dst.addr, filter->dst.addr, sizeof(cfg.dst.addr));
-	if (filter->exclude_port_count > MAX_EXCLUDE_PORTS) {
-		fprintf(stderr,
-			"Warning: %zu exclude ports provided; only the first %d will be applied\n",
-			filter->exclude_port_count,
-			MAX_EXCLUDE_PORTS);
-		cfg.exclude_port_count = MAX_EXCLUDE_PORTS;
-	} else {
-		cfg.exclude_port_count = (unsigned char)filter->exclude_port_count;
-	}
+	cfg.exclude_port_count = (unsigned char)filter->exclude_port_count;
 	for (size_t i = 0; i < cfg.exclude_port_count; i++)
 		cfg.exclude_ports[i] = filter->exclude_ports[i];
 
@@ -919,7 +911,11 @@ int main(int argc, char **argv)
 	int rb_fd = ring_buffer__epoll_fd(rb);
 	if (rb_fd < 0)
 	{
-		fprintf(stderr, "ring_buffer__epoll_fd: %s\n", strerror(errno));
+		char errbuf[128];
+
+		if (libbpf_strerror(rb_fd, errbuf, sizeof(errbuf)) != 0)
+			snprintf(errbuf, sizeof(errbuf), "%s", strerror(-rb_fd));
+		fprintf(stderr, "ring_buffer__epoll_fd: %s (%d)\n", errbuf, rb_fd);
 		goto out;
 	}
 
