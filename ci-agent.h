@@ -9,6 +9,7 @@ enum ev_type {
 #define MAX_HOSTNAME_LEN 256
 #define IPV4_ADDR_LEN 4
 #define IPV6_ADDR_LEN 16
+#define MAX_EXCLUDE_PORTS 16
 
 struct event {
 	__u64 ts_nsec;
@@ -37,4 +38,26 @@ struct dns_mapping_key {
 struct dns_mapping_value {
 	char hostname[MAX_HOSTNAME_LEN];
 	__u64 timestamp;
+};
+
+struct bpf_ip_filter {
+	__u8 set;
+	__u8 loopback;
+	__u8 family;
+	__u8 reserved;
+	__u32 addr[4];
+};
+
+struct bpf_filter_config {
+	__u8 has_pid;
+	__u8 has_proto;
+	__u8 exclude_local_src;
+	__u8 exclude_local_dst;
+	__u32 pid;
+	__u32 type;
+	struct bpf_ip_filter src;
+	struct bpf_ip_filter dst;
+	__u16 exclude_ports[MAX_EXCLUDE_PORTS];
+	__u8 exclude_port_count;
+	__u8 reserved[3];
 };
