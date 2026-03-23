@@ -258,6 +258,8 @@ static int summary_table_grow(struct summary_table *table, size_t new_cap)
 		return -EINVAL;
 	if (new_cap == 0)
 		return -EINVAL;
+	if (new_cap & (new_cap - 1))
+		return -EINVAL;
 	if (new_cap > (SIZE_MAX / sizeof(struct summary_entry)))
 		return -EOVERFLOW;
 
@@ -540,7 +542,7 @@ static int update_bpf_filter_config(struct ci_agent_bpf *skel,
 
 	map_fd = bpf_map__fd(skel->maps.filter_config_map);
 	if (map_fd < 0)
-		return -EINVAL;
+		return map_fd;
 
 	if (bpf_map_update_elem(map_fd, &key, &cfg, BPF_ANY) != 0)
 		return -errno;
@@ -601,14 +603,15 @@ static int parse_sort_by(const char *s, enum summary_sort_by *out)
 	return -EINVAL;
 }
 
-static unsigned long long get_mono_ms(void)
+static int get_mono_ms(unsigned long long *out_ms)
 {
 	struct timespec ts;
 
 	if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0)
-		return 0;
-	return (unsigned long long)ts.tv_sec * 1000ULL +
-	       (unsigned long long)ts.tv_nsec / 1000000ULL;
+		return -errno;
+	*out_ms = (unsigned long long)ts.tv_sec * 1000ULL +
+	          (unsigned long long)ts.tv_nsec / 1000000ULL;
+	return 0;
 }
 
 static void emit_summary_line(struct ci_agent_broadcaster *broadcaster, const char *fmt, ...)
@@ -692,7 +695,16 @@ static void emit_summary(struct summary_table *table,
 		const struct summary_entry *entry = items[i];
 		char saddr_str[INET6_ADDRSTRLEN];
 		char daddr_str[INET6_ADDRSTRLEN];
-		const char *proto_str = entry->key.type == EV_TCP_EGRESS ? "TCP" : "UDP";
+		char proto_unknown[32];
+		const char *proto_str;
+		if (entry->key.type == EV_TCP_EGRESS)
+			proto_str = "TCP";
+		else if (entry->key.type == EV_UDP_EGRESS)
+			proto_str = "UDP";
+		else {
+			snprintf(proto_unknown, sizeof(proto_unknown), "UNKNOWN(%u)", entry->key.type);
+			proto_str = proto_unknown;
+		}
 
 		if (entry->key.family == AF_INET) {
 			format_ipv4(saddr_str, sizeof(saddr_str), entry->key.saddr[0]);
@@ -932,15 +944,24 @@ int main(int argc, char **argv)
 	}
 
 	unsigned long long deadline_ms = 0;
-	if (summarize)
-		deadline_ms = get_mono_ms() + summarize_ms;
+	if (summarize) {
+		if (get_mono_ms(&deadline_ms) != 0) {
+			fprintf(stderr, "clock_gettime failed: %s\n", strerror(errno));
+			goto out;
+		}
+		deadline_ms += summarize_ms;
+	}
 
 	while (!stop) {
 		struct epoll_event events[8];
 		int timeout_ms = -1;
 
 		if (summarize) {
-			unsigned long long now = get_mono_ms();
+			unsigned long long now;
+			if (get_mono_ms(&now) != 0) {
+				fprintf(stderr, "clock_gettime failed, aborting summarize\n");
+				break;
+			}
 			if (now >= deadline_ms)
 				break;
 			unsigned long long remaining = deadline_ms - now;
